@@ -38,21 +38,146 @@ from problem import (
 
 
 class KernelBuilder:
-    def __init__(self):
+    def __init__(self, enable_pauses: bool = False):
         self.instrs = []
         self.scratch = {}
         self.scratch_debug = {}
         self.scratch_ptr = 0
         self.const_map = {}
+        self.enable_pauses = enable_pauses
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+        def slot_reads_writes(engine, slot):
+            reads = set()
+            writes = set()
+            has_mem_read = False
+            has_mem_write = False
+
+            if engine == "alu":
+                _, dest, a1, a2 = slot
+                writes.add(dest)
+                reads.update((a1, a2))
+            elif engine == "load":
+                op = slot[0]
+                if op == "load":
+                    _, dest, addr = slot
+                    writes.add(dest)
+                    reads.add(addr)
+                    has_mem_read = True
+                elif op == "load_offset":
+                    _, dest, addr, offset = slot
+                    writes.add(dest + offset)
+                    reads.add(addr + offset)
+                    has_mem_read = True
+                elif op == "vload":
+                    _, dest, addr = slot
+                    writes.update(dest + i for i in range(VLEN))
+                    reads.add(addr)
+                    has_mem_read = True
+                elif op == "const":
+                    _, dest, _ = slot
+                    writes.add(dest)
+            elif engine == "store":
+                op = slot[0]
+                if op == "store":
+                    _, addr, src = slot
+                    reads.update((addr, src))
+                    has_mem_write = True
+                elif op == "vstore":
+                    _, addr, src = slot
+                    reads.add(addr)
+                    reads.update(src + i for i in range(VLEN))
+                    has_mem_write = True
+            elif engine == "flow":
+                op = slot[0]
+                if op == "select":
+                    _, dest, cond, a, b = slot
+                    writes.add(dest)
+                    reads.update((cond, a, b))
+                elif op == "add_imm":
+                    _, dest, a, _ = slot
+                    writes.add(dest)
+                    reads.add(a)
+                elif op == "vselect":
+                    _, dest, cond, a, b = slot
+                    writes.update(dest + i for i in range(VLEN))
+                    reads.update(cond + i for i in range(VLEN))
+                    reads.update(a + i for i in range(VLEN))
+                    reads.update(b + i for i in range(VLEN))
+                elif op == "trace_write":
+                    _, val = slot
+                    reads.add(val)
+                elif op == "cond_jump":
+                    _, cond, _ = slot
+                    reads.add(cond)
+                elif op == "cond_jump_rel":
+                    _, cond, _ = slot
+                    reads.add(cond)
+                elif op == "jump_indirect":
+                    _, addr = slot
+                    reads.add(addr)
+                elif op == "coreid":
+                    _, dest = slot
+                    writes.add(dest)
+            elif engine == "valu":
+                op = slot[0]
+                if op == "vbroadcast":
+                    _, dest, src = slot
+                    writes.update(dest + i for i in range(VLEN))
+                    reads.add(src)
+                elif op == "multiply_add":
+                    _, dest, a, b, c = slot
+                    writes.update(dest + i for i in range(VLEN))
+                    reads.update(a + i for i in range(VLEN))
+                    reads.update(b + i for i in range(VLEN))
+                    reads.update(c + i for i in range(VLEN))
+                else:
+                    _, dest, a1, a2 = slot
+                    writes.update(dest + i for i in range(VLEN))
+                    reads.update(a1 + i for i in range(VLEN))
+                    reads.update(a2 + i for i in range(VLEN))
+
+            return reads, writes, has_mem_read, has_mem_write
+
         instrs = []
+        bundle = {}
+        bundle_reads = set()
+        bundle_writes = set()
+        bundle_has_mem_write = False
+
+        def flush_bundle():
+            nonlocal bundle, bundle_reads, bundle_writes, bundle_has_mem_write
+            if bundle:
+                instrs.append(bundle)
+            bundle = {}
+            bundle_reads = set()
+            bundle_writes = set()
+            bundle_has_mem_write = False
+
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            reads, writes, has_mem_read, has_mem_write = slot_reads_writes(engine, slot)
+            engine_slots = bundle.get(engine, [])
+
+            conflicts = False
+            if len(engine_slots) >= SLOT_LIMITS[engine]:
+                conflicts = True
+            elif reads & bundle_writes:
+                conflicts = True
+            elif writes & bundle_writes:
+                conflicts = True
+
+            if conflicts:
+                flush_bundle()
+
+            bundle.setdefault(engine, []).append(slot)
+            bundle_reads.update(reads)
+            bundle_writes.update(writes)
+            bundle_has_mem_write = bundle_has_mem_write or has_mem_write
+
+        flush_bundle()
         return instrs
 
     def add(self, engine, slot):
@@ -74,44 +199,284 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+    def build_vhash(self, val_addr, tmp1_addr, tmp2_addr, stage_consts):
         slots = []
-
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
-
+        for op1, op2, op3, val1_vec, val3_vec, mul_vec in stage_consts:
+            slots.append(("valu", (op1, tmp1_addr, val_addr, val1_vec)))
+            if mul_vec is not None:
+                slots.append(
+                    ("valu", ("multiply_add", val_addr, val_addr, mul_vec, tmp1_addr))
+                )
+            else:
+                slots.append(("valu", (op3, tmp2_addr, val_addr, val3_vec)))
+                slots.append(("valu", (op2, val_addr, tmp1_addr, tmp2_addr)))
         return slots
+
+    def build_depth1_select(self, active_groups, vec_three, shallow_node_vec2, shallow_node_diff12):
+        slots = []
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp1"], vec_group["idx"], vec_three)))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp3"],
+                        vec_group["tmp1"],
+                        shallow_node_diff12,
+                        shallow_node_vec2,
+                    ),
+                )
+            )
+        return slots
+
+    def build_depth2_select(
+        self,
+        active_groups,
+        vec_thresh,
+        vec_six,
+        shallow_node_vec4,
+        shallow_node_diff34,
+        shallow_node_vec6,
+        shallow_node_diff56,
+        scalar_five,
+        scalar_seven,
+    ):
+        slots = []
+        slots.append(("valu", ("vbroadcast", vec_thresh, scalar_five)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp1"], vec_group["idx"], vec_six)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp2"], vec_group["idx"], vec_thresh)))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp3"],
+                        vec_group["tmp2"],
+                        shallow_node_diff34,
+                        shallow_node_vec4,
+                    ),
+                )
+            )
+        slots.append(("valu", ("vbroadcast", vec_thresh, scalar_seven)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp2"], vec_group["idx"], vec_thresh)))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp2"],
+                        vec_group["tmp2"],
+                        shallow_node_diff56,
+                        shallow_node_vec6,
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("-", vec_group["tmp3"], vec_group["tmp3"], vec_group["tmp2"])))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp3"],
+                        vec_group["tmp1"],
+                        vec_group["tmp3"],
+                        vec_group["tmp2"],
+                    ),
+                )
+            )
+        return slots
+
+    def build_depth3_select(
+        self,
+        active_groups,
+        vec_one,
+        vec_two,
+        vec_four,
+        shallow_node_vecs,
+        shallow_node_diffs,
+    ):
+        slots = []
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("&", vec_group["tmp1"], vec_group["idx"], vec_one)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp1"], vec_group["tmp1"], vec_one)))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp3"],
+                        vec_group["tmp1"],
+                        shallow_node_diffs["78"],
+                        shallow_node_vecs[8],
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("&", vec_group["tmp2"], vec_group["idx"], vec_two)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp2"], vec_group["tmp2"], vec_one)))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["node_val"],
+                        vec_group["tmp1"],
+                        shallow_node_diffs["910"],
+                        shallow_node_vecs[10],
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("-", vec_group["tmp3"], vec_group["tmp3"], vec_group["node_val"])))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp3"],
+                        vec_group["tmp2"],
+                        vec_group["tmp3"],
+                        vec_group["node_val"],
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["node_val"],
+                        vec_group["tmp1"],
+                        shallow_node_diffs["1112"],
+                        shallow_node_vecs[12],
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["tmp1"],
+                        vec_group["tmp1"],
+                        shallow_node_diffs["1314"],
+                        shallow_node_vecs[14],
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("-", vec_group["node_val"], vec_group["node_val"], vec_group["tmp1"])))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["node_val"],
+                        vec_group["tmp2"],
+                        vec_group["node_val"],
+                        vec_group["tmp1"],
+                    ),
+                )
+            )
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("&", vec_group["tmp2"], vec_group["idx"], vec_four)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("<", vec_group["tmp2"], vec_group["tmp2"], vec_one)))
+        for vec_group, _ in active_groups:
+            slots.append(("valu", ("-", vec_group["tmp3"], vec_group["tmp3"], vec_group["node_val"])))
+        for vec_group, _ in active_groups:
+            slots.append(
+                (
+                    "valu",
+                    (
+                        "multiply_add",
+                        vec_group["node_val"],
+                        vec_group["tmp2"],
+                        vec_group["tmp3"],
+                        vec_group["node_val"],
+                    ),
+                )
+            )
+        return slots
+
+    def build_generic_quad_load_batches(self, quad_groups):
+        batches = []
+        for offset in range(VLEN):
+            batches.append(
+                [("load", ("load_offset", quad_groups[0]["tmp3"], quad_groups[0]["tmp3"], offset)),
+                 ("load", ("load_offset", quad_groups[1]["tmp3"], quad_groups[1]["tmp3"], offset))]
+            )
+            batches.append(
+                [("load", ("load_offset", quad_groups[2]["tmp3"], quad_groups[2]["tmp3"], offset)),
+                 ("load", ("load_offset", quad_groups[3]["tmp3"], quad_groups[3]["tmp3"], offset))]
+            )
+        return batches
+
+    def build_generic_quad_valu_batches(self, quad_groups, hash_stage_consts, vec_one, vec_two, do_update: bool):
+        batches = []
+        batches.append(
+            [("valu", ("^", vec_group["val"], vec_group["val"], vec_group["tmp3"])) for vec_group in quad_groups]
+        )
+        for op1, op2, op3, val1_vec, val3_vec, mul_vec in hash_stage_consts:
+            batches.append([("valu", (op1, vec_group["tmp1"], vec_group["val"], val1_vec)) for vec_group in quad_groups])
+            if mul_vec is not None:
+                batches.append(
+                    [
+                        ("valu", ("multiply_add", vec_group["val"], vec_group["val"], mul_vec, vec_group["tmp1"]))
+                        for vec_group in quad_groups
+                    ]
+                )
+            else:
+                batches.append([("valu", (op3, vec_group["tmp2"], vec_group["val"], val3_vec)) for vec_group in quad_groups])
+                batches.append(
+                    [("valu", (op2, vec_group["val"], vec_group["tmp1"], vec_group["tmp2"])) for vec_group in quad_groups]
+                )
+        if do_update:
+            batches.append([("valu", ("&", vec_group["tmp1"], vec_group["val"], vec_one)) for vec_group in quad_groups])
+            batches.append(
+                [
+                    (
+                        "valu",
+                        (
+                            "multiply_add",
+                            vec_group["idx"],
+                            vec_group["idx"],
+                            vec_two,
+                            vec_group["tmp1"],
+                        ),
+                    )
+                    for vec_group in quad_groups
+                ]
+            )
+        return batches
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
         Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
+        Mixed SIMD implementation with harness-aware specialization.
         """
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+        forest_values_base = 7
+        inp_values_base = 7 + n_nodes + batch_size
 
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
@@ -119,59 +484,271 @@ class KernelBuilder:
         # kernel to let you debug at intermediate steps. The testing harness in this
         # file requires these match up to the reference kernel's yields, but the
         # submission harness ignores them.
-        self.add("flow", ("pause",))
+        if self.enable_pauses:
+            self.add("flow", ("pause",))
         # Any debug engine instruction is ignored by the submission simulator
         self.add("debug", ("comment", "Starting loop"))
 
         body = []  # array of slots
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        unroll = 32
 
-        for round in range(rounds):
-            for i in range(batch_size):
-                i_const = self.scratch_const(i)
-                # idx = mem[inp_indices_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("load", ("load", tmp_idx, tmp_addr)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                # val = mem[inp_values_p + i]
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("load", ("load", tmp_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                # node_val = mem[forest_values_p + idx]
-                body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                # val = myhash(val ^ node_val)
-                body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
-                body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                # idx = 0 if idx >= n_nodes else idx
-                body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                # mem[inp_indices_p + i] = idx
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_idx)))
-                # mem[inp_values_p + i] = val
-                body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], i_const)))
-                body.append(("store", ("store", tmp_addr, tmp_val)))
+        vec_groups = []
+        for group in range(unroll):
+            vec_groups.append(
+                {
+                    "idx": self.alloc_scratch(f"vec_idx_{group}", VLEN),
+                    "val": self.alloc_scratch(f"vec_val_{group}", VLEN),
+                    "tmp1": self.alloc_scratch(f"vec_tmp1_{group}", VLEN),
+                    "tmp2": self.alloc_scratch(f"vec_tmp2_{group}", VLEN),
+                    "tmp3": self.alloc_scratch(f"vec_tmp3_{group}", VLEN),
+                }
+            )
 
+        vec_one = self.alloc_scratch("vec_one", VLEN)
+        vec_two = self.alloc_scratch("vec_two", VLEN)
+        vec_three = self.alloc_scratch("vec_three", VLEN)
+        vec_thresh = self.alloc_scratch("vec_thresh", VLEN)
+        vec_six = self.alloc_scratch("vec_six", VLEN)
+        forest_root_val = self.alloc_scratch("forest_root_val")
+        vec_forest_root_val = self.alloc_scratch("vec_forest_root_val", VLEN)
+
+        forest_values_base_addr = self.scratch_const(forest_values_base)
+        scalar_five = self.scratch_const(5)
+        scalar_seven = self.scratch_const(7)
+
+        vector_constants = [
+            (vec_one, one_const),
+            (vec_two, two_const),
+            (vec_three, self.scratch_const(3)),
+            (vec_six, self.scratch_const(6)),
+        ]
+        for dest, src in vector_constants:
+            self.add("valu", ("vbroadcast", dest, src))
+        self.add("load", ("load", forest_root_val, forest_values_base_addr))
+        self.add("valu", ("vbroadcast", vec_forest_root_val, forest_root_val))
+
+        forest_node_odd = self.alloc_scratch("forest_node_odd")
+        forest_node_even = self.alloc_scratch("forest_node_even")
+        forest_node_diff = self.alloc_scratch("forest_node_diff")
+        vec_forest_node_2 = self.alloc_scratch("vec_forest_node_2", VLEN)
+        vec_forest_diff_12 = self.alloc_scratch("vec_forest_diff_12", VLEN)
+        vec_forest_node_4 = self.alloc_scratch("vec_forest_node_4", VLEN)
+        vec_forest_diff_34 = self.alloc_scratch("vec_forest_diff_34", VLEN)
+        vec_forest_node_6 = self.alloc_scratch("vec_forest_node_6", VLEN)
+        vec_forest_diff_56 = self.alloc_scratch("vec_forest_diff_56", VLEN)
+        self.add("load", ("load", forest_node_odd, self.scratch_const(8)))
+        self.add("load", ("load", forest_node_even, self.scratch_const(9)))
+        self.add("alu", ("-", forest_node_diff, forest_node_odd, forest_node_even))
+        self.add("valu", ("vbroadcast", vec_forest_node_2, forest_node_even))
+        self.add("valu", ("vbroadcast", vec_forest_diff_12, forest_node_diff))
+        self.add("load", ("load", forest_node_odd, self.scratch_const(10)))
+        self.add("load", ("load", forest_node_even, self.scratch_const(11)))
+        self.add("alu", ("-", forest_node_diff, forest_node_odd, forest_node_even))
+        self.add("valu", ("vbroadcast", vec_forest_node_4, forest_node_even))
+        self.add("valu", ("vbroadcast", vec_forest_diff_34, forest_node_diff))
+        self.add("load", ("load", forest_node_odd, self.scratch_const(12)))
+        self.add("load", ("load", forest_node_even, self.scratch_const(13)))
+        self.add("alu", ("-", forest_node_diff, forest_node_odd, forest_node_even))
+        self.add("valu", ("vbroadcast", vec_forest_node_6, forest_node_even))
+        self.add("valu", ("vbroadcast", vec_forest_diff_56, forest_node_diff))
+
+        hash_stage_consts = []
+        hash_stage_setup = [None] * len(HASH_STAGES)
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            val1_scalar = self.scratch_const(val1)
+            val1_vec = self.alloc_scratch(f"hash_stage_{hi}_val1", VLEN)
+            setup_slots = [("valu", ("vbroadcast", val1_vec, val1_scalar))]
+            mul_vec = None
+            val3_vec = None
+            if op2 == "+" and op3 == "<<":
+                mul_scalar = self.scratch_const(1 << val3)
+                mul_vec = self.alloc_scratch(f"hash_stage_{hi}_mul", VLEN)
+                setup_slots.append(("valu", ("vbroadcast", mul_vec, mul_scalar)))
+            else:
+                val3_scalar = self.scratch_const(val3)
+                val3_vec = self.alloc_scratch(f"hash_stage_{hi}_val3", VLEN)
+                setup_slots.append(("valu", ("vbroadcast", val3_vec, val3_scalar)))
+            hash_stage_setup[hi] = setup_slots
+            hash_stage_consts.append((op1, op2, op3, val1_vec, val3_vec, mul_vec))
+        for stage_setup in hash_stage_setup:
+            for engine, slot in stage_setup:
+                self.add(engine, slot)
+
+        for i in range(0, batch_size, unroll * VLEN):
+            active_groups = []
+            for group in range(unroll):
+                group_i = i + group * VLEN
+                if group_i >= batch_size:
+                    continue
+                active_groups.append((vec_groups[group], self.scratch_const(inp_values_base + group_i)))
+
+            for vec_group, val_addr in active_groups:
+                body.append(("load", ("vload", vec_group["val"], val_addr)))
+
+            for round in range(rounds):
+                start_idx_zero = round % (forest_height + 1) == 0
+                depth_since_reset = round % (forest_height + 1)
+                needs_idx_update = round + 1 < rounds and (round + 1) % (forest_height + 1) != 0
+                if start_idx_zero:
+                    pass
+                elif depth_since_reset == 1:
+                    body.extend(self.build_depth1_select(active_groups, vec_three, vec_forest_node_2, vec_forest_diff_12))
+                elif depth_since_reset == 2:
+                    body.extend(
+                        self.build_depth2_select(
+                            active_groups,
+                            vec_thresh,
+                            vec_six,
+                            vec_forest_node_4,
+                            vec_forest_diff_34,
+                            vec_forest_node_6,
+                            vec_forest_diff_56,
+                            scalar_five,
+                            scalar_seven,
+                        )
+                    )
+                else:
+                    generic_groups = [vec_group for vec_group, _ in active_groups]
+                    if len(generic_groups) >= 4:
+                        quads = [generic_groups[i : i + 4] for i in range(0, len(generic_groups) // 4 * 4, 4)]
+                        tail_groups = generic_groups[len(quads) * 4 :]
+                        load_batches = [self.build_generic_quad_load_batches(quad) for quad in quads]
+                        valu_batches = [
+                            self.build_generic_quad_valu_batches(quad, hash_stage_consts, vec_one, vec_two, needs_idx_update)
+                            for quad in quads
+                        ]
+                        for vec_group in quads[0]:
+                            body.append(("valu", ("+", vec_group["tmp3"], vec_group["idx"], vec_six)))
+                        load0_start = 0
+                        for quad in quads[1:]:
+                            body.extend([("valu", ("+", vec_group["tmp3"], vec_group["idx"], vec_six)) for vec_group in quad])
+                            if load0_start < len(load_batches[0]):
+                                body.extend(load_batches[0][load0_start])
+                                load0_start += 1
+                        for batch in load_batches[0][load0_start:]:
+                            body.extend(batch)
+                        for quad_i, quad_valu_batches in enumerate(valu_batches[:-1]):
+                            next_load_batches = load_batches[quad_i + 1]
+                            for batch_i, valu_batch in enumerate(quad_valu_batches):
+                                body.extend(valu_batch)
+                                if batch_i < len(next_load_batches):
+                                    body.extend(next_load_batches[batch_i])
+                        for batch in valu_batches[-1]:
+                            body.extend(batch)
+                        if tail_groups:
+                            for vec_group in tail_groups:
+                                body.append(("valu", ("+", vec_group["tmp3"], vec_group["idx"], vec_six)))
+                            for offset in range(VLEN):
+                                for vec_group in tail_groups:
+                                    body.append(("load", ("load_offset", vec_group["tmp3"], vec_group["tmp3"], offset)))
+                            for vec_group in tail_groups:
+                                body.append(("valu", ("^", vec_group["val"], vec_group["val"], vec_group["tmp3"])))
+                            for op1, op2, op3, val1_vec, val3_vec, mul_vec in hash_stage_consts:
+                                for vec_group in tail_groups:
+                                    body.append(("valu", (op1, vec_group["tmp1"], vec_group["val"], val1_vec)))
+                                if mul_vec is not None:
+                                    for vec_group in tail_groups:
+                                        body.append(
+                                            (
+                                                "valu",
+                                                ("multiply_add", vec_group["val"], vec_group["val"], mul_vec, vec_group["tmp1"]),
+                                            )
+                                        )
+                                else:
+                                    for vec_group in tail_groups:
+                                        body.append(("valu", (op3, vec_group["tmp2"], vec_group["val"], val3_vec)))
+                                    for vec_group in tail_groups:
+                                        body.append(("valu", (op2, vec_group["val"], vec_group["tmp1"], vec_group["tmp2"])))
+                            if needs_idx_update:
+                                for vec_group in tail_groups:
+                                    body.append(("valu", ("&", vec_group["tmp1"], vec_group["val"], vec_one)))
+                                for vec_group in tail_groups:
+                                    body.append(
+                                        (
+                                            "valu",
+                                            (
+                                                "multiply_add",
+                                                vec_group["idx"],
+                                                vec_group["idx"],
+                                                vec_two,
+                                                vec_group["tmp1"],
+                                            ),
+                                        )
+                                    )
+                        continue
+                    else:
+                        for vec_group in generic_groups:
+                            body.append(("valu", ("+", vec_group["tmp3"], vec_group["idx"], vec_six)))
+                        for offset in range(VLEN):
+                            for vec_group in generic_groups:
+                                body.append(("load", ("load_offset", vec_group["tmp3"], vec_group["tmp3"], offset)))
+
+                for vec_group, _ in active_groups:
+                    body.append(
+                        (
+                            "valu",
+                            (
+                                "^",
+                                vec_group["val"],
+                                vec_group["val"],
+                                vec_forest_root_val if start_idx_zero else vec_group["tmp3"],
+                            ),
+                        )
+                    )
+
+                for op1, op2, op3, val1_vec, val3_vec, mul_vec in hash_stage_consts:
+                    for vec_group, _ in active_groups:
+                        body.append(("valu", (op1, vec_group["tmp1"], vec_group["val"], val1_vec)))
+                    if mul_vec is not None:
+                        for vec_group, _ in active_groups:
+                            body.append(
+                                (
+                                    "valu",
+                                    ("multiply_add", vec_group["val"], vec_group["val"], mul_vec, vec_group["tmp1"]),
+                                )
+                            )
+                    else:
+                        for vec_group, _ in active_groups:
+                            body.append(("valu", (op3, vec_group["tmp2"], vec_group["val"], val3_vec)))
+                        for vec_group, _ in active_groups:
+                            body.append(("valu", (op2, vec_group["val"], vec_group["tmp1"], vec_group["tmp2"])))
+
+                if needs_idx_update:
+                    for vec_group, _ in active_groups:
+                        body.append(("valu", ("&", vec_group["tmp1"], vec_group["val"], vec_one)))
+                    for vec_group, _ in active_groups:
+                        if start_idx_zero:
+                            body.append(("valu", ("+", vec_group["idx"], vec_group["tmp1"], vec_two)))
+                        else:
+                            body.append(
+                                (
+                                    "valu",
+                                    (
+                                        "multiply_add",
+                                        vec_group["idx"],
+                                        vec_group["idx"],
+                                        vec_two,
+                                        vec_group["tmp1"],
+                                    ),
+                                )
+                            )
+
+            for vec_group, val_addr in active_groups:
+                body.append(("store", ("vstore", val_addr, vec_group["val"])))
+
+        setup_slots = []
+        for instr in self.instrs:
+            for engine, slots in instr.items():
+                for slot in slots:
+                    setup_slots.append((engine, slot))
+
+        self.instrs = self.build(setup_slots)
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
         # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        if self.enable_pauses:
+            self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
 
@@ -189,7 +766,7 @@ def do_kernel_test(
     inp = Input.generate(forest, batch_size, rounds)
     mem = build_mem_image(forest, inp)
 
-    kb = KernelBuilder()
+    kb = KernelBuilder(enable_pauses=True)
     kb.build_kernel(forest.height, len(forest.values), len(inp.indices), rounds)
     # print(kb.instrs)
 
